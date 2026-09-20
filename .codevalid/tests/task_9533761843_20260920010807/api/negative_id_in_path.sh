@@ -4,65 +4,59 @@ set -euo pipefail
 # Source shared infra
 source .codevalid/tests/task_9533761843_20260920010807/api/_infra.sh
 
-# Given / Preconditions
-cv_step Given "Waiting for app health before testing negative_id_in_path" "$LINENO"
-cv_prereq "Waiting for app health before testing negative_id_in_path" "$LINENO"
+# Preconditions / Given
+cv_step Given "wait-for-app-health" "$LINENO"
+cv_prereq "wait-for-app-health" "$LINENO"
 wait_for_app_health
 
-# When
-cv_step When "send GET /items/-5 to inventory API" "$LINENO"
+# When: perform GET /items/-5
+cv_step When "request-negative-id-in-path: GET /items/-5 should be rejected as invalid positive integer id" "$LINENO"
 REQUEST_METHOD="GET"
 REQUEST_PATH="/items/-5"
+FULL_URL="http://app:${PORT}/items/-5"
 
-# Prepare request observability
-REQUEST_HEADERS="Content-Type: application/json"
-REQUEST_BODY=""
+REQUEST_HEADERS="-X ${REQUEST_METHOD} ${FULL_URL}"
+REQUEST_BODY="(no body for GET)"
 
-printf 'REQUEST_HEADERS: %s
-' "$REQUEST_HEADERS"
-printf 'REQUEST_BODY: %s
-' "$REQUEST_BODY"
+echo "REQUEST_HEADERS=${REQUEST_HEADERS}"
+echo "REQUEST_BODY=${REQUEST_BODY}"
 
-# Perform HTTP call with header capture
-TMP_HDR_FILE="/tmp/negative_id_in_path_headers.$$"
-HTTP_URL="http://app:6713${REQUEST_PATH}"
+# Perform HTTP request with observable headers/body
+curl -sS \
+  -X "${REQUEST_METHOD}" \
+  -D /tmp/negative_id_in_path_headers.txt \
+  -o /tmp/negative_id_in_path_body.json \
+  "${FULL_URL}" || cv_fail "HTTP request to ${FULL_URL} failed" "$LINENO"
 
-# Build curl arguments (no body for GET)
-curl -sS -D "$TMP_HDR_FILE" -X "$REQUEST_METHOD" -w '%{http_code}' "$HTTP_URL" > /tmp/negative_id_in_path_body_and_status.$$ || cv_fail "curl failed for $HTTP_URL" "$LINENO"
+# Capture status code from response headers
+STATUS_CODE="$(awk 'toupper($1) == "HTTP/1.1" { print $2 }' /tmp/negative_id_in_path_headers.txt | tail -n 1)"
 
-# Extract status and body
-RAW_RESPONSE="$(cat /tmp/negative_id_in_path_body_and_status.$$)"
-ACTUAL_STATUS="${RAW_RESPONSE: -3}"
-ACTUAL_BODY="${RAW_RESPONSE::-3}"
+# Log response for diagnosis
+echo "RESPONSE_HEADERS="
+cat /tmp/negative_id_in_path_headers.txt || true
 
-# Echo response observability
-printf 'RESPONSE_HEADERS:
-'
-cat "$TMP_HDR_FILE"
-printf 'RESPONSE_BODY:
-%s
-' "$ACTUAL_BODY"
+echo "RESPONSE_BODY="
+cat /tmp/negative_id_in_path_body.json || true
 
-# Diagnosis marker for HTTP
-cv_http "$REQUEST_METHOD" "$HTTP_URL" "$ACTUAL_STATUS"
+# CodeValid HTTP marker
+cv_http "${REQUEST_METHOD}" "${FULL_URL}" "${STATUS_CODE}"
 
-# Then
-cv_step Then "assert HTTP 400 and JSON error body for invalid negative id" "$LINENO"
-EXPECTED_STATUS=400
-EXPECTED_ERROR_MESSAGE="id must be a positive integer"
-
-if [ "$ACTUAL_STATUS" -ne "$EXPECTED_STATUS" ]; then
-  cv_fail "Expected status $EXPECTED_STATUS for negative_id_in_path, got $ACTUAL_STATUS" "$LINENO"
+# Then: assertions
+cv_step Then "assert-status-code-400: Negative id must return HTTP 400" "$LINENO"
+if [ "${STATUS_CODE}" != "400" ]; then
+  cv_fail "Expected HTTP status 400 for negative id, got ${STATUS_CODE}" "$LINENO"
 fi
 
-ACTUAL_ERROR_MESSAGE="$(printf '%s' "$ACTUAL_BODY" | jq -r '.error // empty')"
+cv_prereq "assert-error-body-id-must-be-positive-integer: Response body must equal {\"error\":\"id must be a positive integer\"}" "$LINENO"
+RESPONSE_BODY_COMPACT="$(jq -c '.' /tmp/negative_id_in_path_body.json)"
+EXPECTED_BODY='{"error":"id must be a positive integer"}'
 
-if [ "$ACTUAL_ERROR_MESSAGE" != "$EXPECTED_ERROR_MESSAGE" ]; then
-  cv_fail "Expected error message '$EXPECTED_ERROR_MESSAGE' for negative_id_in_path, got '$ACTUAL_ERROR_MESSAGE' (body: $ACTUAL_BODY)" "$LINENO"
+if [ "${RESPONSE_BODY_COMPACT}" != "${EXPECTED_BODY}" ]; then
+  cv_fail "Expected body ${EXPECTED_BODY}, got ${RESPONSE_BODY_COMPACT}" "$LINENO"
 fi
 
-# Teardown
-cv_step Cleanup "no database changes made in negative_id_in_path; nothing to clean up." "$LINENO"
+# Teardown / Cleanup
+cv_step Cleanup "teardown-negative-id-in-path: No teardown needed for validation-only request" "$LINENO"
 
-# Success marker for runner
+# Success marker required by runner
 echo "CODEVALID_TEST_ASSERTION_OK:negative_id_in_path"

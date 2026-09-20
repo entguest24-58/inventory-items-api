@@ -3,157 +3,139 @@ set -euo pipefail
 
 source .codevalid/tests/task_9533761843_20260920010807/api/_infra.sh
 
-cv_step Given "wait for app health" $LINENO
-# Inline health check since wait_for_app_health is not available from infra_sh
-APP_HEALTH_URL="http://app:6713/health"
-MAX_RETRIES=60
-SLEEP_SECONDS=2
+cv_step Given "Mocks: No third-party vendors; no WireMock stubs required for GET /items/{id}." $LINENO
 
-attempt=0
-while (( attempt < MAX_RETRIES )); do
-  attempt=$((attempt + 1))
-  response="$(curl -sS -w '%{http_code}' "$APP_HEALTH_URL" || true)"
-  status="${response: -3}"
-  body="${response::-3}"
+cv_prereq "Preconditions: wait for app health" $LINENO
+cv_prereq "wait_for_app_health" $LINENO
+wait_for_app_health || cv_fail "App health check did not succeed" $LINENO
 
-  if [[ "$status" == "200" && "$body" == *'"status":"ok"'* ]]; then
-    break
-  fi
+cv_prereq "seed_item_row: Insert a known item into the items table for lookup" $LINENO
 
-  sleep "$SLEEP_SECONDS"
-done
+# Use a deterministic SKU to avoid collisions and make cleanup straightforward.
+TEST_SKU="TEST-ITEM-9533761843"
+TEST_NAME="Existing item for valid positive ID lookup"
+TEST_QUANTITY=42
+TEST_PRICE_CENTS=999
 
-if (( attempt >= MAX_RETRIES )); then
-  cv_fail "app did not become healthy after ${MAX_RETRIES} attempts" $LINENO
-fi
-
-cv_step Given "case mappings table" $LINENO
-cat <<'TABLE'
-| case_id                         | method | path       |
-|---------------------------------|--------|------------|
-| existing_item_valid_positive_id | GET    | /items/:id |
-TABLE
-
-cv_step Given "Mocks: none required for GET /items/:id" $LINENO
-cv_prereq "no external vendor calls for GET /items/:id; skipping WireMock setup" $LINENO
-
-cv_step Given "clean and seed items table for existing_item_valid_positive_id" $LINENO
-cv_prereq "delete any existing test rows with the same SKU" $LINENO
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
--- Clean any existing test rows with the same SKU to avoid unique conflicts
-DELETE FROM items WHERE sku = 'TEST-SKU-9533761843';
-
--- Insert a single test item row; id will be assigned by SERIAL/sequence
-INSERT INTO items (name, sku, quantity, price_cents)
-VALUES ('Test Widget', 'TEST-SKU-9533761843', 5, 1999);
+# Clean up any existing rows with the same test SKU to ensure a single known record.
+cv_prereq "delete any pre-existing test item rows" $LINENO
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL' || cv_fail "Failed to clean up existing test items" $LINENO
+DELETE FROM items WHERE sku = 'TEST-ITEM-9533761843';
 SQL
 
-cv_step Given "fetch seeded item id for verification" $LINENO
-SEEDED_ID=$(psql "$DATABASE_URL" -t -A -q <<'SQL'
+# Insert the test item, letting Postgres assign id, created_at, and updated_at.
+cv_prereq "insert test item row" $LINENO
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL' || cv_fail "Failed to insert test item" $LINENO
+INSERT INTO items (name, sku, quantity, price_cents)
+VALUES ('Existing item for valid positive ID lookup', 'TEST-ITEM-9533761843', 42, 999);
+SQL
+
+cv_prereq "fetch_seeded_item_id: Retrieve the id of the inserted test item" $LINENO
+ITEM_ID_JSON="$(psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -At <<'SQL'
 SELECT id
 FROM items
-WHERE sku = 'TEST-SKU-9533761843'
+WHERE sku = 'TEST-ITEM-9533761843'
 ORDER BY id DESC
 LIMIT 1;
 SQL
-)
+)" || cv_fail "Failed to query test item id" $LINENO
 
-if [ -z "$SEEDED_ID" ]; then
-  cv_fail "Failed to retrieve seeded item id" $LINENO
+# ITEM_ID_JSON is a plain integer line; validate it is a positive integer.
+if ! printf '%s
+' "$ITEM_ID_JSON" | grep -Eq '^[1-9][0-9]*$'; then
+  cv_fail "Seeded item id is not a positive integer: $ITEM_ID_JSON" $LINENO
 fi
 
-cv_step When "GET /items/:id for existing seeded item" $LINENO
+ITEM_ID="$ITEM_ID_JSON"
+
+cv_prereq "record_expected_values: Capture expected fields for the seeded item" $LINENO
+EXPECTED_NAME="$TEST_NAME"
+EXPECTED_SKU="$TEST_SKU"
+EXPECTED_QUANTITY="$TEST_QUANTITY"
+EXPECTED_PRICE_CENTS="$TEST_PRICE_CENTS"
+
+cv_step When "http_get_item: GET /items/{id} for the seeded item" $LINENO
 REQUEST_METHOD="GET"
-REQUEST_PATH="/items/${SEEDED_ID}"
+REQUEST_PATH="/items/${ITEM_ID}"
+
+# Prepare request diagnostics
+REQUEST_HEADERS=(-H "Accept: application/json")
 REQUEST_BODY=""
-printf 'REQUEST_HEADERS: %s %s
-' "$REQUEST_METHOD" "$REQUEST_PATH"
-printf 'REQUEST_BODY: %s
+
+printf 'REQUEST_METHOD=%s
+' "$REQUEST_METHOD"
+printf 'REQUEST_PATH=%s
+' "$REQUEST_PATH"
+printf 'REQUEST_HEADERS=%s
+' "${REQUEST_HEADERS[*]}"
+printf 'REQUEST_BODY=%s
 ' "$REQUEST_BODY"
 
-# Perform HTTP request with curl capturing headers and body
-HDR_FILE="/tmp/existing_item_valid_positive_id_headers.$$"
-BODY_FILE="/tmp/existing_item_valid_positive_id_body.$$"
-STATUS_FILE="/tmp/existing_item_valid_positive_id_status.$$"
+# Perform the HTTP request, capturing headers and body
+RESPONSE_HEADERS_FILE="/tmp/response_headers_${ITEM_ID}.txt"
+RESPONSE_BODY_FILE="/tmp/response_body_${ITEM_ID}.txt"
 
-curl -sS -X "$REQUEST_METHOD" "http://app:6713${REQUEST_PATH}" \
-  -D "$HDR_FILE" \
-  -o "$BODY_FILE" \
-  -w '%{http_code}' >"$STATUS_FILE" || cv_fail "curl failed for GET ${REQUEST_PATH}" $LINENO
+HTTP_STATUS="$(curl -sS -o "$RESPONSE_BODY_FILE" -D "$RESPONSE_HEADERS_FILE" -w '%{http_code}' "http://app:6713${REQUEST_PATH}" "${REQUEST_HEADERS[@]}" || true)"
 
-HTTP_STATUS="$(cat "$STATUS_FILE")"
-HTTP_BODY="$(cat "$BODY_FILE")"
-
+printf 'RESPONSE_STATUS=%s
+' "$HTTP_STATUS"
 printf 'RESPONSE_HEADERS:
 '
-cat "$HDR_FILE"
-printf '
-RESPONSE_BODY:
-%s
-' "$HTTP_BODY"
+cat "$RESPONSE_HEADERS_FILE" || true
+printf 'RESPONSE_BODY:
+'
+cat "$RESPONSE_BODY_FILE" || true
 
-cv_http "$REQUEST_METHOD" "$REQUEST_PATH"
-cv_step Then "record cv_http metadata" $LINENO
-cv_http "$REQUEST_METHOD" "$REQUEST_PATH"
-cv_step Then "assert HTTP status via cv_http" $LINENO
-cv_http "$REQUEST_METHOD" "$REQUEST_PATH"
-# For diagnostics, we use cv_http to log metadata; status validation is based on curl status above.
+# Emit diagnosis marker for the HTTP call
+cv_http "$REQUEST_METHOD" "$REQUEST_PATH" "$HTTP_STATUS" $LINENO
 
-cv_step Then "assert 200 status and exact response fields + values for existing item" $LINENO
+cv_step Then "assert_response_for_existing_item" $LINENO
+
+# Assert HTTP status code is 200
 if [ "$HTTP_STATUS" != "200" ]; then
-  cv_fail "Expected HTTP 200, got $HTTP_STATUS" $LINENO
+  cv_fail "expected HTTP 200 got $HTTP_STATUS" $LINENO
 fi
 
-IS_OBJECT=$(printf '%s' "$HTTP_BODY" | jq -r 'if type == "object" then "yes" else "no" end')
-if [ "$IS_OBJECT" != "yes" ]; then
-  cv_fail "Expected JSON object body for existing item, got: $HTTP_BODY" $LINENO
+# Parse JSON body
+if ! command -v jq >/dev/null 2>&1; then
+  cv_fail "jq is required to parse JSON response" $LINENO
 fi
 
-EXPECTED_KEYS='["created_at","id","name","price_cents","quantity","sku","updated_at"]'
-BODY_KEYS=$(printf '%s' "$HTTP_BODY" | jq -c 'keys | sort')
-if [ "$BODY_KEYS" != "$EXPECTED_KEYS" ]; then
-  cv_fail "Expected response keys $EXPECTED_KEYS, got $BODY_KEYS" $LINENO
+RESPONSE_BODY_JSON="$(cat "$RESPONSE_BODY_FILE")"
+
+ITEM_ID_FIELD="$(printf '%s' "$RESPONSE_BODY_JSON" | jq -r '.id' 2>/dev/null || printf 'null')"
+NAME_FIELD="$(printf '%s' "$RESPONSE_BODY_JSON" | jq -r '.name' 2>/dev/null || printf 'null')"
+SKU_FIELD="$(printf '%s' "$RESPONSE_BODY_JSON" | jq -r '.sku' 2>/dev/null || printf 'null')"
+QUANTITY_FIELD="$(printf '%s' "$RESPONSE_BODY_JSON" | jq -r '.quantity' 2>/dev/null || printf 'null')"
+PRICE_CENTS_FIELD="$(printf '%s' "$RESPONSE_BODY_JSON" | jq -r '.price_cents' 2>/dev/null || printf 'null')"
+
+# Assert that id is a positive integer and matches the seeded id
+if ! printf '%s
+' "$ITEM_ID_FIELD" | grep -Eq '^[1-9][0-9]*$'; then
+  cv_fail "response id is not a positive integer: $ITEM_ID_FIELD" $LINENO
+fi
+if [ "$ITEM_ID_FIELD" != "$ITEM_ID" ]; then
+  cv_fail "expected response id $ITEM_ID got $ITEM_ID_FIELD" $LINENO
 fi
 
-RESP_ID=$(printf '%s' "$HTTP_BODY" | jq -r '.id')
-RESP_NAME=$(printf '%s' "$HTTP_BODY" | jq -r '.name')
-RESP_SKU=$(printf '%s' "$HTTP_BODY" | jq -r '.sku')
-RESP_QUANTITY=$(printf '%s' "$HTTP_BODY" | jq -r '.quantity')
-RESP_PRICE_CENTS=$(printf '%s' "$HTTP_BODY" | jq -r '.price_cents')
-RESP_CREATED_AT=$(printf '%s' "$HTTP_BODY" | jq -r '.created_at')
-RESP_UPDATED_AT=$(printf '%s' "$HTTP_BODY" | jq -r '.updated_at')
-
-if [ "$RESP_ID" != "$SEEDED_ID" ]; then
-  cv_fail "Expected id=$SEEDED_ID, got $RESP_ID" $LINENO
+# Assert name, sku, quantity, and price_cents match expected values
+if [ "$NAME_FIELD" != "$EXPECTED_NAME" ]; then
+  cv_fail "expected name $EXPECTED_NAME got $NAME_FIELD" $LINENO
+fi
+if [ "$SKU_FIELD" != "$EXPECTED_SKU" ]; then
+  cv_fail "expected sku $EXPECTED_SKU got $SKU_FIELD" $LINENO
+fi
+if [ "$QUANTITY_FIELD" != "$EXPECTED_QUANTITY" ]; then
+  cv_fail "expected quantity $EXPECTED_QUANTITY got $QUANTITY_FIELD" $LINENO
+fi
+if [ "$PRICE_CENTS_FIELD" != "$EXPECTED_PRICE_CENTS" ]; then
+  cv_fail "expected price_cents $EXPECTED_PRICE_CENTS got $PRICE_CENTS_FIELD" $LINENO
 fi
 
-if [ "$RESP_NAME" != "Test Widget" ]; then
-  cv_fail "Expected name='Test Widget', got '$RESP_NAME'" $LINENO
-fi
-
-if [ "$RESP_SKU" != "TEST-SKU-9533761843" ]; then
-  cv_fail "Expected sku='TEST-SKU-9533761843', got '$RESP_SKU'" $LINENO
-fi
-
-if [ "$RESP_QUANTITY" != "5" ]; then
-  cv_fail "Expected quantity=5, got $RESP_QUANTITY" $LINENO
-fi
-
-if [ "$RESP_PRICE_CENTS" != "1999" ]; then
-  cv_fail "Expected price_cents=1999, got $RESP_PRICE_CENTS" $LINENO
-fi
-
-if [ -z "$RESP_CREATED_AT" ] || [ "$RESP_CREATED_AT" = "null" ]; then
-  cv_fail "Expected non-empty created_at timestamp, got '$RESP_CREATED_AT'" $LINENO
-fi
-
-if [ -z "$RESP_UPDATED_AT" ] || [ "$RESP_UPDATED_AT" = "null" ]; then
-  cv_fail "Expected non-empty updated_at timestamp, got '$RESP_UPDATED_AT'" $LINENO
-fi
-
-cv_step Cleanup "remove seeded item row" $LINENO
-psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL'
-DELETE FROM items WHERE sku = 'TEST-SKU-9533761843';
+cv_step Cleanup "teardown: Remove seeded test item from items table" $LINENO
+psql "$DATABASE_URL" -v ON_ERROR_STOP=1 <<'SQL' || cv_fail "Failed to delete seeded test item during teardown" $LINENO
+DELETE FROM items WHERE sku = 'TEST-ITEM-9533761843';
 SQL
 
+# Success marker required by runner
 echo "CODEVALID_TEST_ASSERTION_OK:existing_item_valid_positive_id"

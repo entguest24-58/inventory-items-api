@@ -1,74 +1,67 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Source shared infra (diagnostic markers, helpers)
+# Source shared infra
 source .codevalid/tests/task_9533761843_20260920010807/api/_infra.sh
 
-# Case: non_numeric_id_in_path
-
-# Given / Preconditions
-cv_step Given "wait for app health on GET /health" "$LINENO"
-cv_prereq "wait for app health on GET /health" "$LINENO"
+# Given: app is healthy
+cv_step Given "wait for app health" "$LINENO"
+cv_prereq "wait_for_app_health" "$LINENO"
 wait_for_app_health
 
-# When: send GET /items/abc with non-numeric id path parameter
-cv_step When "send GET /items/abc with non-numeric id path parameter" "$LINENO"
+# When: perform GET /items/abc
+cv_step When "Request GET /items/{id} with non-numeric path parameter" "$LINENO"
+REQUEST_PATH="http://app:6713/items/abc"
+REQUEST_HEADERS_FILE="request_headers.txt"
+RESPONSE_HEADERS_FILE="response_headers.txt"
 
-METHOD="GET"
-REQUEST_PATH="/items/abc"
-URL="http://app:6713${REQUEST_PATH}"
+# Prepare and echo request details
+REQUEST_HEADERS="Accept: application/json"
+REQUEST_BODY=""  # GET request has no body
+printf 'REQUEST_HEADERS: %s
+' "$REQUEST_HEADERS"
+printf 'REQUEST_BODY: %s
+' "$REQUEST_BODY"
 
-REQUEST_BODY=""  # GET has no body
+# Perform request, capturing headers, body, and status
+curl -sS -X GET "$REQUEST_PATH" \
+  -H "$REQUEST_HEADERS" \
+  -D "$RESPONSE_HEADERS_FILE" \
+  -o response.json \
+  -w '%{http_code}' > status.txt || cv_fail "curl failed for $REQUEST_PATH" "$LINENO"
 
-echo "REQUEST_HEADERS: Accept: application/json"
-echo "REQUEST_BODY: ${REQUEST_BODY}"
+STATUS_CODE="$(cat status.txt)"
+cv_http GET "$REQUEST_PATH" "$STATUS_CODE"
 
-# Perform HTTP request and capture headers/body/status
-HDR_FILE="/tmp/cv_http_headers_$$.txt"
-RESP_FILE="/tmp/cv_http_body_$$.txt"
+# Echo response headers and body
+RESPONSE_HEADERS="$(cat "$RESPONSE_HEADERS_FILE")"
+RESPONSE_BODY="$(cat response.json)"
+printf 'RESPONSE_HEADERS:
+%s
+' "$RESPONSE_HEADERS"
+printf 'RESPONSE_BODY:
+%s
+' "$RESPONSE_BODY"
 
-# Build curl command
-curl -sS \
-  -D "$HDR_FILE" \
-  -o "$RESP_FILE" \
-  -w '%{http_code}' \
-  -H 'Accept: application/json' \
-  -X "$METHOD" \
-  "$URL" > /tmp/cv_http_status_$$.txt
-
-STATUS_CODE="$(cat /tmp/cv_http_status_$$.txt)"
-RESPONSE_BODY="$(cat "$RESP_FILE")"
-
-# Echo response for observability
-echo "RESPONSE_HEADERS:"
-cat "$HDR_FILE"
-echo "RESPONSE_BODY:"
-cat "$RESP_FILE"
-
-# Diagnosis marker for HTTP call
-cv_http "$METHOD" "$URL" "$STATUS_CODE"
-
-# Then: assertions
-cv_step Then "assert status 400 and error body for non-numeric id" "$LINENO"
-
-BODY_JSON="$RESPONSE_BODY"
-
-if [ "$STATUS_CODE" -ne 400 ]; then
-  cv_fail "expected HTTP 400 for non-numeric id, got $STATUS_CODE" "$LINENO"
+# Then: assert HTTP 400 and body structure
+cv_step Then "Assert HTTP 400 status for invalid non-numeric id" "$LINENO"
+if [ "$STATUS_CODE" != "400" ]; then
+  cv_fail "Expected HTTP 400 for non-numeric id, got $STATUS_CODE" "$LINENO"
 fi
 
-ERROR_VALUE="$(echo "$BODY_JSON" | jq -r '.error // empty')"
+cv_prereq "Assert JSON error body for invalid non-numeric id" "$LINENO"
+ERROR_VALUE="$(jq -r '.error // empty' response.json)"
 if [ "$ERROR_VALUE" != "id must be a positive integer" ]; then
-  cv_fail "expected error message 'id must be a positive integer', got '${ERROR_VALUE}' (body: $BODY_JSON)" "$LINENO"
+  cv_fail "Expected error message 'id must be a positive integer', got '${ERROR_VALUE}' in body: ${RESPONSE_BODY}" "$LINENO"
 fi
 
-KEYS="$(echo "$BODY_JSON" | jq -r 'keys | sort | join(",")')"
-if [ "$KEYS" != "error" ]; then
-  cv_fail "expected response JSON to contain exactly key 'error', got keys '${KEYS}' (body: $BODY_JSON)" "$LINENO"
+KEY_COUNT="$(jq 'keys | length' response.json)"
+if [ "$KEY_COUNT" != "1" ]; then
+  cv_fail "Expected response JSON to contain exactly one key ('error'), got ${KEY_COUNT} keys in body: ${RESPONSE_BODY}" "$LINENO"
 fi
 
-# Teardown
-cv_step Cleanup "no teardown required for non-numeric id case; no DB changes were made" "$LINENO"
+# Cleanup / Teardown
+cv_step Cleanup "No database or app state changes performed; nothing to clean up." "$LINENO"
 
 # Success marker required by runner
 echo "CODEVALID_TEST_ASSERTION_OK:non_numeric_id_in_path"

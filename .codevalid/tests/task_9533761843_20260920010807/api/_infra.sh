@@ -3,6 +3,7 @@ set -euo pipefail
 
 # Shared environment variables
 export DATABASE_URL="${DATABASE_URL:-postgresql://app:app@toxiproxy:5432/appdb}"
+export PORT="${PORT:-6713}"
 
 # Logging helpers
 cv_step() {
